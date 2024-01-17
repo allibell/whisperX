@@ -30,7 +30,7 @@ def create_video_with_captions(audio_file_path, subtitles_file_path, output_file
     for subtitle in subtitles:
         # Create a TextClip for each subtitle
         background_clip = ImageClip(black_background, duration=(subtitle.end - subtitle.start).total_seconds())
-        txt_clip = TextClip(subtitle.content, fontsize=35, color='white', font="Arial", size=background_clip.size)
+        txt_clip = TextClip(subtitle.content, fontsize=35, color='white', font="Arial", size=background_clip.size, method="caption", align="center", interline=0.5)
         txt_clip = txt_clip.set_pos('center').set_duration((subtitle.end - subtitle.start).total_seconds())
         txt_clip = txt_clip.on_color(
                   color=(0,0,0), pos=(6,'center'), col_opacity=0.6)
