@@ -5,3 +5,7 @@ transformers
 pandas
 setuptools>=65
 nltk
+moviepy
+pydub
+srt
+numpy
