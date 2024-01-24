@@ -288,6 +288,13 @@ Those who have [supported this work financially](https://www.buymeacoffee.com/ma
 
 Finally, thanks to the OS [contributors](https://github.com/m-bain/whisperX/graphs/contributors) of this project, keeping it going and identifying bugs.
 
+
+### Allison notes
+example command
+```
+whisperx background_noise_1.wav --compute_type float32 --diarize --hf_token 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
+```
+
 <h2 align="left" id="cite">Citation</h2>
 If you use this in your research, please cite the paper:
 
