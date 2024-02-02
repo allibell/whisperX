@@ -9,3 +9,4 @@ moviepy
 pydub
 srt
 numpy
+spacy
