@@ -17,6 +17,7 @@ from queue import Queue
 import wave
 from datetime import datetime, timedelta
 from time import sleep
+import threading
 
 
 def cli():
@@ -199,151 +200,163 @@ def cli():
     # model = load_model(model_name, device=device, download_root=model_dir)
     model = load_model(model_name, device=device, device_index=device_index, download_root=model_dir, compute_type=compute_type, language=args['language'], asr_options=asr_options, vad_options={"vad_onset": vad_onset, "vad_offset": vad_offset}, task=task, threads=faster_whisper_threads)
 
-    if realtime:
-        # The last time a recording was retrieved from the queue.
-        phrase_time = None
-        # Thread safe Queue for passing data from the threaded recording callback.
-        data_queue = Queue()
-        # We use SpeechRecognizer to record our audio because it has a nice feature where it can detect when speech ends.
-        recorder = sr.Recognizer()
-        recorder.energy_threshold = 1000
-        # Definitely do this, dynamic energy compensation lowers the energy threshold dramatically to a point where the SpeechRecognizer never stops recording.
-        recorder.dynamic_energy_threshold = False
+    # The last time a recording was retrieved from the queue.
+    phrase_time = None
+    # Thread safe Queue for passing data from the threaded recording callback.
+    data_queue = Queue()
+    # We use SpeechRecognizer to record our audio because it has a nice feature where it can detect when speech ends.
+    recorder = sr.Recognizer()
+    recorder.energy_threshold = 1000
+    # Definitely do this, dynamic energy compensation lowers the energy threshold dramatically to a point where the SpeechRecognizer never stops recording.
+    recorder.dynamic_energy_threshold = False
 
-        original_framerate = 16000
-        record_timeout = 2
-        phrase_timeout = 3
-        current_position = 0
+    original_framerate = 16000
+    record_timeout = 2
+    phrase_timeout = 3
+    current_position = 0
 
-        while True:
-            try:
-                now = datetime.utcnow()
-                # Pull raw recorded audio from the queue.
-                with source as src:
-                    audio = recorder.record(src, duration=record_timeout, offset=current_position)
-                    if len(audio.frame_data) == 0:
-                        break
-                    current_position += record_timeout
-                    data = audio.get_raw_data()
-                    data_queue.put(data)
-                if not data_queue.empty():
-                    phrase_complete = False
-                    # If enough time has passed between recordings, consider the phrase complete.
-                    # Clear the current working audio buffer to start over with the new data.
-                    if phrase_time and now - phrase_time > timedelta(seconds=phrase_timeout):
-                        phrase_complete = True
-                    # This is the last time we received new audio data from the queue.
-                    phrase_time = now
-                    
-                    # Combine audio data from queue
-                    audio_data = b''.join(data_queue.queue)
-                    # print(f"@@@@ type {type(audio_data)}")
-                    data_queue.queue.clear()
-                    
-                    # Convert in-ram buffer to something the model can use directly without needing a temp file.
-                    # Convert data from 16 bit wide integers to floating point with a width of 32 bits.
-                    # Clamp the audio stream frequency to a PCM wavelength compatible default of 32768hz max.
-                    # audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+    # audio_data_by_thread = {}
 
-                    # Read the transcription.
-                    # result = audio_model.transcribe(audio_np, fp16=torch.cuda.is_available())
+    def record_audio():
+        r = sr.Recognizer()
+        with sr.Microphone(sample_rate=16000) as source:
+            while True:
+                audio = r.record(source, duration=30)  # Record 10-second snippets
+                data_queue.put(audio.get_wav_data())  # Add audio data to the queue
+                # audio_data_by_thread[threading.current_thread().name] = audio
 
-                    with wave.open('audio.wav', 'wb') as f:
-                        f.setnchannels(1)
-                        f.setsampwidth(2)
-                        f.setframerate(original_framerate)
-                        f.writeframes(audio_data)
+    # Start a new thread to record audio
+    threading.Thread(target=record_audio, daemon=True).start()
 
-                    audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-                    print(">>Performing transcription...")
-                    result = model.transcribe(audio_np, batch_size=batch_size, chunk_size=chunk_size, print_progress=print_progress)
-                    results.append((result, f"microphone_{current_position}"))
-                    print(f"@@@@ results.... @@@@")
-                    print(results)
-                    # text = "\n".join([f"Speaker {u.speaker}: {u.text}" for u in (aai_result.utterances or [])])
+    while True:
+        try:
+            now = datetime.utcnow()
+            # Pull raw recorded audio from the queue.
+            # with source as src:
+            #     audio = recorder.record(src, duration=record_timeout, offset=current_position)
+            #     if len(audio.frame_data) == 0:
+            #         break
+            #     current_position += record_timeout
+            #     data = audio.get_raw_data()
+            #     data_queue.put(data)
+            if not data_queue.empty():
+                current_position += record_timeout
+                phrase_complete = False
+                # If enough time has passed between recordings, consider the phrase complete.
+                # Clear the current working audio buffer to start over with the new data.
+                if phrase_time and now - phrase_time > timedelta(seconds=phrase_timeout):
+                    phrase_complete = True
+                # This is the last time we received new audio data from the queue.
+                phrase_time = now
+                
+                # Combine audio data from queue
+                # audio_data = b''.join(data_queue.queue)
+                audio_data = b''.join(data_queue.get() for _ in range(data_queue.qsize()))
+                # print(f"@@@@ type {type(audio_data)}")
+                # data_queue.queue.clear()
+                
+                # Convert in-ram buffer to something the model can use directly without needing a temp file.
+                # Convert data from 16 bit wide integers to floating point with a width of 32 bits.
+                # Clamp the audio stream frequency to a PCM wavelength compatible default of 32768hz max.
+                # audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
 
-                    # If we detected a pause between recordings, add a new item to our transcription.
-                    # Otherwise edit the existing one.
-                    # if phrase_complete:
-                    #     transcription.append(text)
-                    # else:
-                    #     transcription[-1] = text
+                # Read the transcription.
+                # result = audio_model.transcribe(audio_np, fp16=torch.cuda.is_available())
 
-                    # Clear the console to reprint the updated transcription.
-                    # os.system('cls' if os.name=='nt' else 'clear')
-                    # for line in transcription:
-                    #     print(line)
+                audio_snippet_file_path = f"audio_{current_position}.wav"
+                with wave.open(audio_snippet_file_path, 'wb') as f:
+                    f.setnchannels(1)
+                    f.setsampwidth(2)
+                    f.setframerate(original_framerate)
+                    f.writeframes(audio_data)
 
-                    # for utterance in (aai_result.utterances or []):
-                    #     print(f"Speaker {utterance.speaker}: {utterance.text}")
+                audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+                print(">>Performing transcription...")
+                result = model.transcribe(audio_np, batch_size=batch_size, chunk_size=chunk_size, print_progress=print_progress)
+                results.append((result, audio_snippet_file_path))
+                # print(f"@@@@ results.... @@@@")
+                print(results)
 
-                    # Flush stdout.
-                    # print('', end='', flush=True)
 
-                    # Infinite loops are bad for processors, must sleep.
-                    sleep(0.25)
-                else:
-                    break
-            except KeyboardInterrupt:
-                break
-    else:
-        for audio_path in args.pop("audio"):
-            audio = load_audio(audio_path)
-            # >> VAD & ASR
-            print(">>Performing transcription...")
+                # Unload Whisper and VAD
+                # del model
+                torch.cuda.empty_cache()
 
-            result = model.transcribe(audio, batch_size=batch_size, chunk_size=chunk_size, print_progress=print_progress)
-            results.append((result, audio_path))
+                # Part 2: Align Loop
+                if not no_align:
+                    tmp_results = results
+                    results = []
+                    if not align_model or type(align_model) == str:
+                        align_model, align_metadata = load_align_model(align_language, device, model_name=align_model)
+                    for result, audio_path in tmp_results:
+                        # >> Align
+                        if len(tmp_results) > 1:
+                            input_audio = audio_path
+                        else:
+                            # lazily load audio from part 1
+                            # input_audio = audio_data
+                            input_audio = audio_np
 
-    # Unload Whisper and VAD
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
+                        if align_model is not None and len(result["segments"]) > 0:
+                            if result.get("language", "en") != align_metadata["language"]:
+                                # load new language
+                                print(f"New language found ({result['language']})! Previous was ({align_metadata['language']}), loading new alignment model for new language...")
+                                align_model, align_metadata = load_align_model(result["language"], device)
+                            print(">>Performing alignment...")
 
-    # Part 2: Align Loop
-    if not no_align:
-        tmp_results = results
-        results = []
-        align_model, align_metadata = load_align_model(align_language, device, model_name=align_model)
-        for result, audio_path in tmp_results:
-            # >> Align
-            if len(tmp_results) > 1:
-                input_audio = audio_path
+                            result = align(result["segments"], align_model, align_metadata, input_audio, device, interpolate_method=interpolate_method, return_char_alignments=return_char_alignments, print_progress=print_progress)
+
+                        results.append((result, audio_path))
+
+                    torch.cuda.empty_cache()
+
+                # >> Diarize
+                if diarize:
+                    if hf_token is None:
+                        print("Warning, no --hf_token used, needs to be saved in environment variable, otherwise will throw error loading diarization model...")
+                    tmp_results = results
+                    print(">>Performing diarization...")
+                    results = []
+                    diarize_model = DiarizationPipeline(use_auth_token=hf_token, device=device)
+                    for result, input_audio_path in tmp_results:
+                        diarize_segments = diarize_model(input_audio_path, min_speakers=min_speakers, max_speakers=max_speakers)
+                        result = assign_word_speakers(diarize_segments, result)
+                        results.append((result, input_audio_path))
+                # >> Write
+                for result, audio_path in results:
+                    result["language"] = align_language
+                    writer(result, audio_path, writer_args)
+                # text = "\n".join([f"Speaker {u.speaker}: {u.text}" for u in (aai_result.utterances or [])])
+
+                # If we detected a pause between recordings, add a new item to our transcription.
+                # Otherwise edit the existing one.
+                # if phrase_complete:
+                #     transcription.append(text)
+                # else:
+                #     transcription[-1] = text
+
+                # Clear the console to reprint the updated transcription.
+                # os.system('cls' if os.name=='nt' else 'clear')
+                # for line in transcription:
+                #     print(line)
+
+                # for utterance in (aai_result.utterances or []):
+                #     print(f"Speaker {utterance.speaker}: {utterance.text}")
+
+                # Flush stdout.
+                # print('', end='', flush=True)
+
+                # Infinite loops are bad for processors, must sleep.
+                sleep(0.25)
             else:
-                # lazily load audio from part 1
-                input_audio = audio
+                pass
+        except KeyboardInterrupt:
+            del model
+            del align_model
+            gc.collect()
+            torch.cuda.empty_cache()
+            break
 
-            if align_model is not None and len(result["segments"]) > 0:
-                if result.get("language", "en") != align_metadata["language"]:
-                    # load new language
-                    print(f"New language found ({result['language']})! Previous was ({align_metadata['language']}), loading new alignment model for new language...")
-                    align_model, align_metadata = load_align_model(result["language"], device)
-                print(">>Performing alignment...")
-                result = align(result["segments"], align_model, align_metadata, input_audio, device, interpolate_method=interpolate_method, return_char_alignments=return_char_alignments, print_progress=print_progress)
-
-            results.append((result, audio_path))
-
-        # Unload align model
-        del align_model
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    # >> Diarize
-    if diarize:
-        if hf_token is None:
-            print("Warning, no --hf_token used, needs to be saved in environment variable, otherwise will throw error loading diarization model...")
-        tmp_results = results
-        print(">>Performing diarization...")
-        results = []
-        diarize_model = DiarizationPipeline(use_auth_token=hf_token, device=device)
-        for result, input_audio_path in tmp_results:
-            diarize_segments = diarize_model(input_audio_path, min_speakers=min_speakers, max_speakers=max_speakers)
-            result = assign_word_speakers(diarize_segments, result)
-            results.append((result, input_audio_path))
-    # >> Write
-    for result, audio_path in results:
-        result["language"] = align_language
-        writer(result, audio_path, writer_args)
 
 if __name__ == "__main__":
     cli()

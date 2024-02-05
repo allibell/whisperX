@@ -10,3 +10,7 @@ pydub
 srt
 numpy
 spacy
+threading
+speech_recognition
+queue
+concurrent

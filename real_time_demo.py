@@ -17,6 +17,8 @@ from queue import Queue
 import wave
 from datetime import datetime, timedelta
 from time import sleep
+import threading
+import concurrent.futures
 
 
 def cli():
@@ -194,38 +196,49 @@ def cli():
     writer_args = {arg: args.pop(arg) for arg in word_options}
     
     # Part 1: VAD & ASR Loop
+    results_queue = Queue()
     results = []
     tmp_results = []
     # model = load_model(model_name, device=device, download_root=model_dir)
     model = load_model(model_name, device=device, device_index=device_index, download_root=model_dir, compute_type=compute_type, language=args['language'], asr_options=asr_options, vad_options={"vad_onset": vad_onset, "vad_offset": vad_offset}, task=task, threads=faster_whisper_threads)
 
-    if realtime:
-        # The last time a recording was retrieved from the queue.
-        phrase_time = None
-        # Thread safe Queue for passing data from the threaded recording callback.
-        data_queue = Queue()
-        # We use SpeechRecognizer to record our audio because it has a nice feature where it can detect when speech ends.
-        recorder = sr.Recognizer()
-        recorder.energy_threshold = 1000
-        # Definitely do this, dynamic energy compensation lowers the energy threshold dramatically to a point where the SpeechRecognizer never stops recording.
-        recorder.dynamic_energy_threshold = False
+    # The last time a recording was retrieved from the queue.
+    phrase_time = None
+    # Thread safe Queue for passing data from the threaded recording callback.
+    data_queue = Queue()
+    # We use SpeechRecognizer to record our audio because it has a nice feature where it can detect when speech ends.
+    recorder = sr.Recognizer()
+    recorder.energy_threshold = 1000
+    # Definitely do this, dynamic energy compensation lowers the energy threshold dramatically to a point where the SpeechRecognizer never stops recording.
+    recorder.dynamic_energy_threshold = False
 
-        original_framerate = 16000
-        record_timeout = 2
-        phrase_timeout = 3
-        current_position = 0
+    original_framerate = 16000
+    record_timeout = 2
+    phrase_timeout = 3
+    current_position = 0
+
+    def record_audio():
+        r = sr.Recognizer()
+        with sr.Microphone(sample_rate=16000) as source:
+            while True:
+                audio = r.record(source, duration=10)  # Record 10-second snippets
+                data_queue.put(audio.get_wav_data())  # Add audio data to the queue
+
+    def record_and_transcribe():
+        # Start a new thread to record audio
+        threading.Thread(target=record_audio, daemon=True).start()
 
         while True:
             try:
                 now = datetime.utcnow()
                 # Pull raw recorded audio from the queue.
-                with source as src:
-                    audio = recorder.record(src, duration=record_timeout, offset=current_position)
-                    if len(audio.frame_data) == 0:
-                        break
-                    current_position += record_timeout
-                    data = audio.get_raw_data()
-                    data_queue.put(data)
+                # with source as src:
+                #     audio = recorder.record(src, duration=record_timeout, offset=current_position)
+                #     if len(audio.frame_data) == 0:
+                #         break
+                #     current_position += record_timeout
+                #     data = audio.get_raw_data()
+                #     data_queue.put(data)
                 if not data_queue.empty():
                     phrase_complete = False
                     # If enough time has passed between recordings, consider the phrase complete.
@@ -236,9 +249,10 @@ def cli():
                     phrase_time = now
                     
                     # Combine audio data from queue
-                    audio_data = b''.join(data_queue.queue)
+                    # audio_data = b''.join(data_queue.queue)
+                    audio_data = b''.join(data_queue.get() for _ in range(data_queue.qsize()))
                     # print(f"@@@@ type {type(audio_data)}")
-                    data_queue.queue.clear()
+                    # data_queue.queue.clear()
                     
                     # Convert in-ram buffer to something the model can use directly without needing a temp file.
                     # Convert data from 16 bit wide integers to floating point with a width of 32 bits.
@@ -260,6 +274,7 @@ def cli():
                     results.append((result, f"microphone_{current_position}"))
                     print(f"@@@@ results.... @@@@")
                     print(results)
+                    results_queue.put(result)
                     # text = "\n".join([f"Speaker {u.speaker}: {u.text}" for u in (aai_result.utterances or [])])
 
                     # If we detected a pause between recordings, add a new item to our transcription.
@@ -283,67 +298,74 @@ def cli():
                     # Infinite loops are bad for processors, must sleep.
                     sleep(0.25)
                 else:
-                    break
+                    pass
             except KeyboardInterrupt:
                 break
-    else:
-        for audio_path in args.pop("audio"):
-            audio = load_audio(audio_path)
-            # >> VAD & ASR
-            print(">>Performing transcription...")
 
-            result = model.transcribe(audio, batch_size=batch_size, chunk_size=chunk_size, print_progress=print_progress)
-            results.append((result, audio_path))
+    def process_results():
+        while True:
+            try:
+                print("@@process_results...")
+                results = results_queue.get()
+                print(f"@@@ results: {results}")
+                # Unload Whisper and VAD
+                del model
+                gc.collect()
+                torch.cuda.empty_cache()
 
-    # Unload Whisper and VAD
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
+                # Part 2: Align Loop
+                if not no_align:
+                    tmp_results = results
+                    results = []
+                    align_model, align_metadata = load_align_model(align_language, device, model_name=align_model)
+                    for result, audio_path in tmp_results:
+                        # >> Align
+                        if len(tmp_results) > 1:
+                            input_audio = audio_path
+                        else:
+                            # lazily load audio from part 1
+                            # input_audio = audio
+                            raise Exception("Not implemented yet")
 
-    # Part 2: Align Loop
-    if not no_align:
-        tmp_results = results
-        results = []
-        align_model, align_metadata = load_align_model(align_language, device, model_name=align_model)
-        for result, audio_path in tmp_results:
-            # >> Align
-            if len(tmp_results) > 1:
-                input_audio = audio_path
-            else:
-                # lazily load audio from part 1
-                input_audio = audio
+                        if align_model is not None and len(result["segments"]) > 0:
+                            if result.get("language", "en") != align_metadata["language"]:
+                                # load new language
+                                print(f"New language found ({result['language']})! Previous was ({align_metadata['language']}), loading new alignment model for new language...")
+                                align_model, align_metadata = load_align_model(result["language"], device)
+                            print(">>Performing alignment...")
+                            result = align(result["segments"], align_model, align_metadata, input_audio, device, interpolate_method=interpolate_method, return_char_alignments=return_char_alignments, print_progress=print_progress)
 
-            if align_model is not None and len(result["segments"]) > 0:
-                if result.get("language", "en") != align_metadata["language"]:
-                    # load new language
-                    print(f"New language found ({result['language']})! Previous was ({align_metadata['language']}), loading new alignment model for new language...")
-                    align_model, align_metadata = load_align_model(result["language"], device)
-                print(">>Performing alignment...")
-                result = align(result["segments"], align_model, align_metadata, input_audio, device, interpolate_method=interpolate_method, return_char_alignments=return_char_alignments, print_progress=print_progress)
+                        results.append((result, audio_path))
 
-            results.append((result, audio_path))
+                    # Unload align model
+                    del align_model
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
-        # Unload align model
-        del align_model
-        gc.collect()
-        torch.cuda.empty_cache()
+                # >> Diarize
+                if diarize:
+                    if hf_token is None:
+                        print("Warning, no --hf_token used, needs to be saved in environment variable, otherwise will throw error loading diarization model...")
+                    tmp_results = results
+                    print(">>Performing diarization...")
+                    results = []
+                    diarize_model = DiarizationPipeline(use_auth_token=hf_token, device=device)
+                    for result, input_audio_path in tmp_results:
+                        diarize_segments = diarize_model(input_audio_path, min_speakers=min_speakers, max_speakers=max_speakers)
+                        result = assign_word_speakers(diarize_segments, result)
+                        results.append((result, input_audio_path))
+                # >> Write
+                for result, audio_path in results:
+                    result["language"] = align_language
+                    writer(result, audio_path, writer_args)
 
-    # >> Diarize
-    if diarize:
-        if hf_token is None:
-            print("Warning, no --hf_token used, needs to be saved in environment variable, otherwise will throw error loading diarization model...")
-        tmp_results = results
-        print(">>Performing diarization...")
-        results = []
-        diarize_model = DiarizationPipeline(use_auth_token=hf_token, device=device)
-        for result, input_audio_path in tmp_results:
-            diarize_segments = diarize_model(input_audio_path, min_speakers=min_speakers, max_speakers=max_speakers)
-            result = assign_word_speakers(diarize_segments, result)
-            results.append((result, input_audio_path))
-    # >> Write
-    for result, audio_path in results:
-        result["language"] = align_language
-        writer(result, audio_path, writer_args)
+                results_queue.task_done()
+            except KeyboardInterrupt:
+                break
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future1 = executor.submit(record_and_transcribe)
+        future2 = executor.submit(process_results)
 
 if __name__ == "__main__":
     cli()
